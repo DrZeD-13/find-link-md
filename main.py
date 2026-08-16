@@ -194,7 +194,7 @@ def check_http_link(link: str, timeout: float = 1.0) -> Tuple[str, int, str]:
     except Exception as e:
         return f'Error({e})', 0, str(e)
 
-    if 200 <= code < 300:
+    if 200 <= code < 400:
         return f'Ok({code})', code, 'Успешно'
     return f'Error({code})', code, f'HTTP {code}'
 
