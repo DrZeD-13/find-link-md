@@ -4,22 +4,33 @@ Link Checker for Markdown Files
 Консольное приложение для проверки ссылок (http:// и file://) в .md файлах
 """
 
-import sys
-import os
-import subprocess
-import re
 import argparse
-from urllib.parse import urlparse, unquote
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import re
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.request
 from collections import defaultdict
-from typing import Dict, List, Tuple, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Tuple
+from urllib.parse import unquote, urlparse
 
-# Цвета для вывода
 GREEN = '\033[92m'
 RED = '\033[91m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
+
+# find + grep: markdown [text](url) / ![alt](url), без кавычек title
+GREP_LINK_PATTERN = r'\[[^]]*\]\((https?://[^)"[:space:]]+|file://[^)"[:space:]]+)'
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Возвращает статус текущего URL без перехода по редиректу."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 def parse_arguments():
@@ -46,87 +57,103 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def find_md_files(folder_path: str) -> List[str]:
-    """Поиск всех .md файлов в директории рекурсивно"""
+def _ensure_folder(folder_path: str) -> str:
     if not os.path.exists(folder_path):
         raise FileNotFoundError(f"Путь не существует: {folder_path}")
-
     if not os.path.isdir(folder_path):
         raise NotADirectoryError(f"Указанный путь не является директорией: {folder_path}")
+    return os.path.abspath(folder_path)
 
+
+def find_md_files(folder_path: str) -> List[str]:
+    """Поиск всех .md файлов через find (без os.walk)."""
+    folder_path = _ensure_folder(folder_path)
     try:
-        # Используем find для поиска .md файлов
-        cmd = ['find', folder_path, '-name', '*.md', '-type', 'f']
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        files = [f for f in result.stdout.strip().split('\n') if f]
-        return files
-    except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"Ошибка при поиске файлов: {e.stderr}")
+        result = subprocess.run(
+            ['find', folder_path, '-name', '*.md', '-type', 'f'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
     except PermissionError as e:
-        raise PermissionError(f"Нет прав доступа к директории: {e}")
+        raise PermissionError(f"Нет прав доступа к директории: {e}") from e
+
+    if result.returncode != 0:
+        err = (result.stderr or '').strip() or 'неизвестная ошибка find'
+        raise RuntimeError(f"Ошибка при поиске файлов: {err}")
+
+    return [line for line in result.stdout.splitlines() if line]
 
 
-def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]]]:
+def _normalize_file_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.path:
+        return url
+    path = os.path.normpath(unquote(parsed.path))
+    if not path.startswith('/'):
+        path = '/' + path
+    return f'file://{path}'
+
+
+def _is_absolute_file_url(url: str) -> bool:
+    """Абсолютные file:///path; относительные file://./... пропускаем."""
+    if not url.startswith('file://'):
+        return False
+    return url.startswith('file:///')
+
+
+def extract_links_from_files(folder_path: str) -> Dict[str, List[str]]:
     """
-    Извлечение ссылок из .md файлов с помощью find + grep
+    Извлечение ссылок из .md файлов с помощью find + grep.
 
     Returns:
-        Dict[url, List[Tuple[file_path, line_number]]]
+        Dict[url, List[file_path]]
     """
-    if not os.path.exists(folder_path):
-        raise FileNotFoundError(f"Путь не существует: {folder_path}")
-
-    # Регулярное выражение для поиска ссылок в Markdown
-    # Ищем [text](url) и ![alt](url)
-    link_pattern = re.compile(r'[!]?\[[^\]]*\]\(([^)]+)\)')
-
-    links_map = defaultdict(list)
+    folder_path = _ensure_folder(folder_path)
     md_files = find_md_files(folder_path)
-
     if not md_files:
         raise ValueError("В указанной директории нет .md файлов")
 
-    for file_path in md_files:
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+    try:
+        result = subprocess.run(
+            [
+                'find', folder_path, '-name', '*.md', '-type', 'f',
+                '-exec', 'grep', '-Hn', '-o', '-E', GREP_LINK_PATTERN, '{}', ';',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except PermissionError as e:
+        raise PermissionError(f"Нет прав доступа к файлам: {e}") from e
 
-            # Находим все ссылки в файле
-            matches = link_pattern.findall(content)
+    links_map: Dict[str, List[str]] = defaultdict(list)
+    seen = set()
+    url_re = re.compile(r'\[[^\]]*\]\((https?://[^)"\s]+|file://[^)"\s]+)')
 
-            # Проверяем каждую ссылку
-            for match in matches:
-                # Очищаем URL от тайтлов и лишних пробелов
-                url = match.strip()
-                # Удаляем возможный тайтл: "url "title""
-                if ' ' in url and (url.startswith('"') or url.startswith("'")):
-                    # Если URL содержит пробел и кавычки, это может быть тайтл
-                    parts = url.split(' ', 1)
-                    if parts[0].strip():
-                        url = parts[0].strip()
-
-                # Проверяем, что ссылка начинается с http://, https:// или file://
-                if url.startswith(('http://', 'https://', 'file://')):
-                    # Пропускаем относительные file:// ссылки
-                    if url.startswith('file://') and url.count('/') < 3:
-                        continue
-
-                    # Нормализуем путь для file://
-                    if url.startswith('file://'):
-                        parsed = urlparse(url)
-                        if parsed.path:
-                            # Декодируем URL-кодированные символы
-                            path = unquote(parsed.path)
-                            # Нормализуем путь
-                            if '..' in path or '//' in path:
-                                path = os.path.normpath(path)
-                            url = f'file://{path}'
-
-                    links_map[url].append((file_path, 0))  # 0 - номер строки не определяем
-
-        except (PermissionError, UnicodeDecodeError) as e:
-            print(f"{RED}Ошибка при чтении файла {file_path}: {e}{RESET}", file=sys.stderr)
+    for raw_line in result.stdout.splitlines():
+        # path:line:match — путь может содержать ':'
+        parts = raw_line.split(':', 2)
+        if len(parts) < 3:
             continue
+        file_path, _line_no, match = parts
+        url_match = url_re.search(match)
+        if not url_match:
+            continue
+        url = url_match.group(1).strip()
+
+        if url.startswith('file://'):
+            if not _is_absolute_file_url(url):
+                continue
+            url = _normalize_file_url(url)
+        elif not url.startswith(('http://', 'https://')):
+            continue
+
+        key = (url, file_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        links_map[url].append(file_path)
 
     return dict(links_map)
 
@@ -134,83 +161,83 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
 def check_file_link(link: str) -> Tuple[str, int, str]:
     """Проверка file:// ссылок"""
     parsed = urlparse(link)
-    file_path = parsed.path
+    file_path = unquote(parsed.path)
 
-    if not file_path:
+    if not file_path or not os.path.exists(file_path):
         return 'Error(404)', 404, 'Файл не найден'
-
-    if os.path.exists(file_path):
-        return 'Ok(200)', 200, 'Файл существует'
-    else:
-        return 'Error(404)', 404, 'Файл не найден'
+    return 'Ok(200)', 200, 'Файл существует'
 
 
 def check_http_link(link: str, timeout: float = 1.0) -> Tuple[str, int, str]:
-    """Проверка http:// и https:// ссылок"""
+    """Проверка http:// и https:// ссылок без следования редиректам."""
+    request = urllib.request.Request(
+        link,
+        method='GET',
+        headers={'User-Agent': 'LinkChecker/1.0'},
+    )
+    opener = urllib.request.build_opener(NoRedirectHandler)
+
     try:
-        response = requests.get(
-            link,
-            timeout=timeout,
-            allow_redirects=False,
-            headers={'User-Agent': 'LinkChecker/1.0'}
-        )
-
-        if 200 <= response.status_code < 300:
-            return f'Ok({response.status_code})', response.status_code, 'Успешно'
-        else:
-            return f'Error({response.status_code})', response.status_code, f'HTTP {response.status_code}'
-
-    except requests.exceptions.Timeout:
+        with opener.open(request, timeout=timeout) as response:
+            code = response.getcode()
+    except urllib.error.HTTPError as e:
+        code = e.code
+    except socket.timeout:
         return 'Error(Timeout)', 408, 'Таймаут'
-    except requests.exceptions.ConnectionError:
+    except TimeoutError:
+        return 'Error(Timeout)', 408, 'Таймаут'
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return 'Error(Timeout)', 408, 'Таймаут'
         return 'Error(ConnectionError)', 0, 'Ошибка соединения'
-    except requests.exceptions.RequestException as e:
-        return f'Error({str(e)})', 0, str(e)
+    except Exception as e:
+        return f'Error({e})', 0, str(e)
+
+    if 200 <= code < 300:
+        return f'Ok({code})', code, 'Успешно'
+    return f'Error({code})', code, f'HTTP {code}'
 
 
-def check_link_status(link: str, timeout: float = 1.0) -> Tuple[str, int, str]:
+def check_link_status(link: str, base_path: str, timeout: float = 1.0) -> Tuple[str, int, str]:
     """Проверка статуса ссылки в зависимости от протокола"""
+    del base_path  # абсолютные file://, корень сканирования не нужен
     if link.startswith('file://'):
         return check_file_link(link)
-    elif link.startswith(('http://', 'https://')):
+    if link.startswith(('http://', 'https://')):
         return check_http_link(link, timeout)
-    else:
-        return 'Error(Unknown)', 0, 'Неизвестный протокол'
+    return 'Error(Unknown)', 0, 'Неизвестный протокол'
 
 
-def display_results(results: Dict[str, List[Tuple[str, str, str, str]]], total_unique: int):
-    """
-    Отображение результатов в виде таблицы
-
-    results: Dict[url, List[Tuple[status, status_code, message, file_path]]]
-    """
-    # Собираем все результаты для отображения
+def display_results(
+    results: Dict[str, List[Tuple[str, int, str, str]]],
+    total_unique: int,
+    folder_path: str,
+) -> None:
+    """Отображение результатов в виде таблицы."""
     all_results = []
-    success_count = 0
-    error_count = 0
+    unique_status = {}
 
     for url, entries in results.items():
+        if not entries:
+            continue
+        unique_status[url] = entries[0][0]
         for status, status_code, message, file_path in entries:
-            all_results.append((url, status, status_code, message, file_path))
-            if status.startswith('Ok'):
-                success_count += 1
-            else:
-                error_count += 1
+            rel_file = os.path.relpath(file_path, folder_path)
+            all_results.append((url, status, status_code, message, rel_file))
 
-    # Сортировка: сначала ошибки, потом успешные
-    all_results.sort(key=lambda x: (x[1].startswith('Ok'), x[2]), reverse=False)
+    all_results.sort(key=lambda x: (x[1].startswith('Ok'), x[0]))
 
-    # Вывод таблицы
-    print(f"\n{BOLD}{'='*120}{RESET}")
+    success_count = sum(1 for status in unique_status.values() if status.startswith('Ok'))
+    error_count = total_unique - success_count
+
+    print(f"\n{BOLD}{'=' * 120}{RESET}")
     print(f"{BOLD}РЕЗУЛЬТАТЫ ПРОВЕРКИ ССЫЛОК{RESET}")
-    print(f"{BOLD}{'='*120}{RESET}")
-
-    # Заголовки
-    print(f"{'Статус':<20} {'Ссылка':<60} {'Файл':<40}")
-    print(f"{'-'*120}")
+    print(f"{BOLD}{'=' * 120}{RESET}")
+    print(f"{'Статус':<28} {'Ссылка':<56} {'Файл':<34}")
+    print(f"{'-' * 120}")
 
     for url, status, status_code, message, file_path in all_results:
-        # Выбираем цвет
         if status.startswith('Ok'):
             color = GREEN
             icon = '✅'
@@ -218,34 +245,33 @@ def display_results(results: Dict[str, List[Tuple[str, str, str, str]]], total_u
             color = RED
             icon = '❌'
 
-        # Сокращаем длинные ссылки
-        display_url = url if len(url) <= 60 else url[:57] + '...'
-        # Сокращаем длинные пути
-        display_file = file_path if len(file_path) <= 40 else '...' + file_path[-37:]
+        display_url = url if len(url) <= 56 else url[:53] + '...'
+        display_file = file_path if len(file_path) <= 34 else '...' + file_path[-31:]
+        status_plain = f"{icon} {status}"
+        print(f"{color}{status_plain:<28}{RESET} {display_url:<56} {display_file:<34}")
 
-        status_display = f"{color}{icon} {status}{RESET}"
-        print(f"{status_display:<20} {display_url:<60} {display_file:<40}")
-
-    print(f"{'-'*120}")
-
-    # Итоговая статистика
-    total = success_count + error_count
-    print(f"\n{BOLD}Итого: {total}{RESET} "
-          f"{GREEN}✅ Успешно: {success_count}{RESET} "
-          f"{RED}❌ Ошибок: {error_count}{RESET}")
-    print(f"{BOLD}Уникальных ссылок: {total_unique}{RESET}")
+    print(f"{'-' * 120}")
+    print(
+        f"\n{BOLD}Итого: {total_unique}{RESET} "
+        f"{GREEN}✅ Успешно: {success_count}{RESET} "
+        f"{RED}❌ Ошибок: {error_count}{RESET}"
+    )
 
 
 def main():
     """Главная функция программы"""
     try:
+        if sys.platform != 'darwin':
+            print(f"{RED}Ошибка: приложение поддерживается только на macOS{RESET}", file=sys.stderr)
+            return 1
+
         args = parse_arguments()
+        folder_path = os.path.abspath(args.path)
+        _ensure_folder(folder_path)
 
-        print(f"{BOLD}Сканирование директории: {args.path}{RESET}")
+        print(f"{BOLD}Сканирование директории: {folder_path}{RESET}")
 
-        # Извлекаем ссылки из файлов
-        links_map = extract_links_from_files(args.path)
-
+        links_map = extract_links_from_files(folder_path)
         if not links_map:
             print(f"{RED}Ссылок не найдено в .md файлах{RESET}")
             return 0
@@ -253,42 +279,32 @@ def main():
         total_unique = len(links_map)
         print(f"Найдено {total_unique} уникальных ссылок")
 
-        # Проверяем статусы ссылок
-        results = {}
         link_status_cache = {}
+        workers = max(1, min(args.max_workers, 10, total_unique))
 
-        # Используем ThreadPoolExecutor для параллельной проверки
-        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_link = {
-                executor.submit(check_link_status, link, args.timeout): link
-                for link in links_map.keys()
+                executor.submit(check_link_status, link, folder_path, args.timeout): link
+                for link in links_map
             }
-
             for future in as_completed(future_to_link):
                 link = future_to_link[future]
                 try:
-                    status, status_code, message = future.result()
-                    link_status_cache[link] = (status, status_code, message)
+                    link_status_cache[link] = future.result()
                 except Exception as e:
-                    link_status_cache[link] = (f'Error(Exception)', 0, str(e))
+                    link_status_cache[link] = ('Error(Exception)', 0, str(e))
 
-        # Формируем результаты для отображения
+        results = {}
         for link, files in links_map.items():
-            if link in link_status_cache:
-                status, status_code, message = link_status_cache[link]
-                results[link] = [
-                    (status, status_code, message, file_path)
-                    for file_path, _ in files
-                ]
-            else:
-                results[link] = [
-                    ('Error(Unknown)', 0, 'Неизвестная ошибка', file_path)
-                    for file_path, _ in files
-                ]
+            status, status_code, message = link_status_cache.get(
+                link, ('Error(Unknown)', 0, 'Неизвестная ошибка')
+            )
+            results[link] = [
+                (status, status_code, message, file_path)
+                for file_path in files
+            ]
 
-        # Отображаем результаты
-        display_results(results, total_unique)
-
+        display_results(results, total_unique, folder_path)
         return 0
 
     except FileNotFoundError as e:
