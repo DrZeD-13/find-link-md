@@ -16,8 +16,17 @@ Reference-style тоже игнорируем:
 [ref link][refid]
 [refid]: https://reference-style.example
 
-Относительный file:// пропускаем:
+Относительный file:// (относительно этого .md файла):
 [relative](file://./relative.md)
+
+Относительный file:// без точки:
+[relative no dot](file://relative.md)
+
+Относительный file:// в родительскую папку:
+[relative parent](file://../test1.md)
+
+Несуществующий относительный файл:
+[relative missing](file://./no-such-file.md)
 
 Несуществующий абсолютный файл:
 [missing](file:///this/path/does/not/exist.txt)
