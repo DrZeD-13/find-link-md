@@ -22,9 +22,13 @@ RED = '\033[91m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 
-# find + grep: markdown [text](target) / ![alt](target), без кавычек title;
-# фильтрация по типу ссылки (http, file, локальный путь) выполняется в Python
-GREP_LINK_PATTERN = r'\[[^]]*\]\([^)"[:space:]]+'
+# grep лишь отбирает строки-кандидаты по фиксированной подстроке "](",
+# чтобы поведение не зависело от реализации grep (GNU на Linux, BSD на macOS);
+# сам разбор markdown-ссылок [text](target) / ![alt](target) делает Python
+GREP_LINE_MARKER = ']('
+
+# markdown [text](target), target без пробелов и кавычек (title отсекается)
+_LINK_RE = re.compile(r'\[[^\]]*\]\(([^)"\s]+)')
 
 # mailto:, ftp:, tel: и прочие схемы, которые не проверяем
 _SCHEME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
@@ -128,7 +132,7 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
         result = subprocess.run(
             [
                 'find', folder_path, '-name', '*.md', '-type', 'f',
-                '-exec', 'grep', '-Hn', '-o', '-E', GREP_LINK_PATTERN, '{}', ';',
+                '-exec', 'grep', '-Hn', '-F', GREP_LINE_MARKER, '{}', ';',
             ],
             capture_output=True,
             text=True,
@@ -139,35 +143,33 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
 
     links_map: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
     seen = set()
-    url_re = re.compile(r'\[[^\]]*\]\(([^)"\s]+)')
 
     for raw_line in result.stdout.splitlines():
-        # path:line:match — путь может содержать ':'
+        # path:line:содержимое строки — путь может содержать ':'
         parts = raw_line.split(':', 2)
         if len(parts) < 3:
             continue
-        file_path, _line_no, match = parts
-        url_match = url_re.search(match)
-        if not url_match:
-            continue
-        url = url_match.group(1).strip()
+        file_path, _line_no, line = parts
 
-        if url.startswith(('http://', 'https://')):
-            check_url = url
-        elif url.startswith('#'):
-            continue  # якорь внутри текущего файла
-        elif _SCHEME_RE.match(url) and not url.startswith('file://'):
-            continue  # mailto:, ftp: и другие схемы
-        else:
-            check_url = _resolve_local_url(url, file_path)
-            if not check_url:
+        for url_match in _LINK_RE.finditer(line):
+            url = url_match.group(1).strip()
+
+            if url.startswith(('http://', 'https://')):
+                check_url = url
+            elif url.startswith('#'):
+                continue  # якорь внутри текущего файла
+            elif _SCHEME_RE.match(url) and not url.startswith('file://'):
+                continue  # mailto:, ftp: и другие схемы
+            else:
+                check_url = _resolve_local_url(url, file_path)
+                if not check_url:
+                    continue
+
+            key = (check_url, file_path)
+            if key in seen:
                 continue
-
-        key = (check_url, file_path)
-        if key in seen:
-            continue
-        seen.add(key)
-        links_map[check_url].append((file_path, url))
+            seen.add(key)
+            links_map[check_url].append((file_path, url))
 
     return dict(links_map)
 

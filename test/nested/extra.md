@@ -46,3 +46,6 @@ Reference-style тоже игнорируем:
 
 Другие схемы — не проверяем:
 [mail](mailto:user@example.com)
+
+Две ссылки в одной строке:
+[first (одна)](relative.md) и [second (другая)](../test3.md)
