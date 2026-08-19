@@ -22,8 +22,12 @@ RED = '\033[91m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 
-# find + grep: markdown [text](url) / ![alt](url), без кавычек title
-GREP_LINK_PATTERN = r'\[[^]]*\]\((https?://[^)"[:space:]]+|file://[^)"[:space:]]+)'
+# find + grep: markdown [text](target) / ![alt](target), без кавычек title;
+# фильтрация по типу ссылки (http, file, локальный путь) выполняется в Python
+GREP_LINK_PATTERN = r'\[[^]]*\]\([^)"[:space:]]+'
+
+# mailto:, ftp:, tel: и прочие схемы, которые не проверяем
+_SCHEME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -85,15 +89,21 @@ def find_md_files(folder_path: str) -> List[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
-def _resolve_file_url(url: str, source_file: str) -> str:
+def _resolve_local_url(target: str, source_file: str) -> str:
     """
-    Приведение file:// ссылки к абсолютному виду.
+    Приведение локальной ссылки к абсолютному виду file:///path.
 
-    Абсолютные (file:///path) нормализуются как есть, относительные
-    (file://./x.md, file://../x.md, file://sub/x.md) разрешаются
-    относительно папки .md файла, в котором найдена ссылка.
+    Поддерживаются оба формата записи: со схемой (file:///abs, file://./rel)
+    и обычным путём (/abs, ./rel, ../rel, sub/file.md). Относительные пути
+    разрешаются относительно папки .md файла, в котором найдена ссылка.
+    Якорь (#section) при проверке существования файла отбрасывается.
     """
-    raw_path = unquote(url[len('file://'):])
+    if target.startswith('file://'):
+        target = target[len('file://'):]
+    target = target.split('#', 1)[0]
+    if not target:
+        return ''
+    raw_path = unquote(target)
     if not raw_path.startswith('/'):
         raw_path = os.path.join(os.path.dirname(source_file), raw_path)
     return f'file://{os.path.normpath(raw_path)}'
@@ -129,7 +139,7 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
 
     links_map: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
     seen = set()
-    url_re = re.compile(r'\[[^\]]*\]\((https?://[^)"\s]+|file://[^)"\s]+)')
+    url_re = re.compile(r'\[[^\]]*\]\(([^)"\s]+)')
 
     for raw_line in result.stdout.splitlines():
         # path:line:match — путь может содержать ':'
@@ -142,12 +152,16 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
             continue
         url = url_match.group(1).strip()
 
-        if url.startswith('file://'):
-            check_url = _resolve_file_url(url, file_path)
-        elif url.startswith(('http://', 'https://')):
+        if url.startswith(('http://', 'https://')):
             check_url = url
+        elif url.startswith('#'):
+            continue  # якорь внутри текущего файла
+        elif _SCHEME_RE.match(url) and not url.startswith('file://'):
+            continue  # mailto:, ftp: и другие схемы
         else:
-            continue
+            check_url = _resolve_local_url(url, file_path)
+            if not check_url:
+                continue
 
         key = (check_url, file_path)
         if key in seen:

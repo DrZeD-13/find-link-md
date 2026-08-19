@@ -30,3 +30,19 @@ Reference-style тоже игнорируем:
 
 Несуществующий абсолютный файл:
 [missing](file:///this/path/does/not/exist.txt)
+
+Локальные пути без схемы file://:
+[plain relative](relative.md)
+[plain dot](./relative.md)
+[plain parent](../test2.md)
+[plain absolute](/etc/hosts)
+[plain missing](./no-such-plain.md)
+
+Ссылка с якорем (якорь отбрасывается при проверке):
+[with anchor](relative.md#section)
+
+Якорь внутри файла — не проверяем:
+[anchor only](#some-section)
+
+Другие схемы — не проверяем:
+[mail](mailto:user@example.com)
