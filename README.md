@@ -1,7 +1,14 @@
 # Link Checker for Markdown Files
 
 ## Описание
-Консольное приложение для проверки ссылок (`http://`, `https://` и `file://`) в `.md` файлах.
+Консольное приложение для проверки ссылок (`http://`, `https://` и локальных) в `.md` файлах.
+
+Локальные ссылки поддерживаются в обоих форматах записи — со схемой `file://` и обычным путём без схемы:
+
+- абсолютные: `file:///path/to/file`, `/path/to/file`
+- относительные: `file://./relative.md`, `./relative.md`, `../parent.md`, `sub/file.md` — разрешаются относительно папки `.md` файла, в котором найдена ссылка
+
+Якорь в ссылке (`./doc.md#section`) отбрасывается при проверке. Якоря внутри файла (`#section`) и прочие схемы (`mailto:` и т.п.) не проверяются.
 
 ## Установка
 ### Через Python
@@ -25,6 +32,13 @@ python3 main.py /path/to/folder
 python3 main.py /path/to/folder --timeout 1.0 --max-workers 10
 ```
 
+Проверить версию установленной сборки:
+```bash
+./link_checker --version
+```
+
+Файлы `.md` поддерживаются в кодировках UTF-8 и UTF-16 (с BOM).
+
 ## Пример вывода
 Таблица со статусом, ссылкой и путём к `.md` файлу. Сначала ошибки, затем успешные проверки.
 
@@ -35,7 +49,12 @@ python3 main.py /path/to/folder --timeout 1.0 --max-workers 10
 Статистика считается по уникальным ссылкам. Если одна ссылка встречается в нескольких файлах, HTTP/file статус запрашивается один раз.
 
 ## Сборка
+PyInstaller лучше ставить в виртуальное окружение (на macOS с Homebrew `pip install` в системный Python не сработает).
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pyinstaller
 pyinstaller --onefile --name link_checker main.py
 ```
 

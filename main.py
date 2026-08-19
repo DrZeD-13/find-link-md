@@ -17,13 +17,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 from urllib.parse import unquote, urlparse
 
+__version__ = '1.1'
+
 GREEN = '\033[92m'
 RED = '\033[91m'
 RESET = '\033[0m'
 BOLD = '\033[1m'
 
-# find + grep: markdown [text](url) / ![alt](url), без кавычек title
-GREP_LINK_PATTERN = r'\[[^]]*\]\((https?://[^)"[:space:]]+|file://[^)"[:space:]]+)'
+# grep лишь отбирает строки-кандидаты по фиксированной подстроке "](",
+# чтобы поведение не зависело от реализации grep (GNU на Linux, BSD на macOS);
+# сам разбор markdown-ссылок [text](target) / ![alt](target) делает Python
+GREP_LINE_MARKER = ']('
+
+# markdown [text](target), target без пробелов и кавычек (title отсекается)
+_LINK_RE = re.compile(r'\[[^\]]*\]\(([^)"\s]+)')
+
+# mailto:, ftp:, tel: и прочие схемы, которые не проверяем
+_SCHEME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -53,6 +63,11 @@ def parse_arguments():
         type=int,
         default=10,
         help='Максимальное количество параллельных HTTP запросов (по умолчанию: 10)'
+    )
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'link_checker {__version__}'
     )
     return parser.parse_args()
 
@@ -85,21 +100,32 @@ def find_md_files(folder_path: str) -> List[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
-def _normalize_file_url(url: str) -> str:
-    parsed = urlparse(url)
-    if not parsed.path:
-        return url
-    path = os.path.normpath(unquote(parsed.path))
-    if not path.startswith('/'):
-        path = '/' + path
-    return f'file://{path}'
-
-
-def _is_absolute_file_url(url: str) -> bool:
-    """Абсолютные file:///path; относительные file://./... пропускаем."""
-    if not url.startswith('file://'):
+def _has_utf16_bom(file_path: str) -> bool:
+    try:
+        with open(file_path, 'rb') as fh:
+            return fh.read(2) in (b'\xff\xfe', b'\xfe\xff')
+    except OSError:
         return False
-    return url.startswith('file:///')
+
+
+def _resolve_local_url(target: str, source_file: str) -> str:
+    """
+    Приведение локальной ссылки к абсолютному виду file:///path.
+
+    Поддерживаются оба формата записи: со схемой (file:///abs, file://./rel)
+    и обычным путём (/abs, ./rel, ../rel, sub/file.md). Относительные пути
+    разрешаются относительно папки .md файла, в котором найдена ссылка.
+    Якорь (#section) при проверке существования файла отбрасывается.
+    """
+    if target.startswith('file://'):
+        target = target[len('file://'):]
+    target = target.split('#', 1)[0]
+    if not target:
+        return ''
+    raw_path = unquote(target)
+    if not raw_path.startswith('/'):
+        raw_path = os.path.join(os.path.dirname(source_file), raw_path)
+    return f'file://{os.path.normpath(raw_path)}'
 
 
 def extract_links_from_files(folder_path: str) -> Dict[str, List[str]]:
@@ -108,6 +134,9 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[str]]:
 
     Returns:
         Dict[url, List[file_path]]
+
+    url — ссылка для проверки и вывода: http(s) как записана,
+    локальные приводятся к абсолютному виду file:///path.
     """
     folder_path = _ensure_folder(folder_path)
     md_files = find_md_files(folder_path)
@@ -115,13 +144,16 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[str]]:
         raise ValueError("В указанной директории нет .md файлов")
 
     try:
+        # -a: файлы с бинарными байтами не пропускать молча
         result = subprocess.run(
             [
                 'find', folder_path, '-name', '*.md', '-type', 'f',
-                '-exec', 'grep', '-Hn', '-o', '-E', GREP_LINK_PATTERN, '{}', ';',
+                '-exec', 'grep', '-Hn', '-a', '-F', GREP_LINE_MARKER, '{}', ';',
             ],
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=False,
         )
     except PermissionError as e:
@@ -129,31 +161,47 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[str]]:
 
     links_map: Dict[str, List[str]] = defaultdict(list)
     seen = set()
-    url_re = re.compile(r'\[[^\]]*\]\((https?://[^)"\s]+|file://[^)"\s]+)')
+
+    def add_links_from_line(line: str, file_path: str) -> None:
+        for url_match in _LINK_RE.finditer(line):
+            url = url_match.group(1).strip()
+
+            if url.startswith(('http://', 'https://')):
+                check_url = url
+            elif url.startswith('#'):
+                continue  # якорь внутри текущего файла
+            elif _SCHEME_RE.match(url) and not url.startswith('file://'):
+                continue  # mailto:, ftp: и другие схемы
+            else:
+                check_url = _resolve_local_url(url, file_path)
+                if not check_url:
+                    continue
+
+            key = (check_url, file_path)
+            if key in seen:
+                continue
+            seen.add(key)
+            links_map[check_url].append(file_path)
 
     for raw_line in result.stdout.splitlines():
-        # path:line:match — путь может содержать ':'
+        # path:line:содержимое строки — путь может содержать ':'
         parts = raw_line.split(':', 2)
         if len(parts) < 3:
             continue
-        file_path, _line_no, match = parts
-        url_match = url_re.search(match)
-        if not url_match:
-            continue
-        url = url_match.group(1).strip()
+        file_path, _line_no, line = parts
+        add_links_from_line(line, file_path)
 
-        if url.startswith('file://'):
-            if not _is_absolute_file_url(url):
-                continue
-            url = _normalize_file_url(url)
-        elif not url.startswith(('http://', 'https://')):
+    # UTF-16 файлы (с BOM) grep не видит: подстрока "](" в них разбита
+    # нулевыми байтами, поэтому такие файлы разбираем напрямую в Python
+    for file_path in md_files:
+        if not _has_utf16_bom(file_path):
             continue
-
-        key = (url, file_path)
-        if key in seen:
+        try:
+            with open(file_path, encoding='utf-16', errors='replace') as fh:
+                for line in fh:
+                    add_links_from_line(line, file_path)
+        except OSError:
             continue
-        seen.add(key)
-        links_map[url].append(file_path)
 
     return dict(links_map)
 
@@ -201,7 +249,7 @@ def check_http_link(link: str, timeout: float = 1.0) -> Tuple[str, int, str]:
 
 def check_link_status(link: str, base_path: str, timeout: float = 1.0) -> Tuple[str, int, str]:
     """Проверка статуса ссылки в зависимости от протокола"""
-    del base_path  # абсолютные file://, корень сканирования не нужен
+    del base_path  # file:// уже приведены к абсолютным при извлечении
     if link.startswith('file://'):
         return check_file_link(link)
     if link.startswith(('http://', 'https://')):
@@ -261,15 +309,16 @@ def display_results(
 def main():
     """Главная функция программы"""
     try:
+        args = parse_arguments()
+
         if sys.platform != 'darwin':
             print(f"{RED}Ошибка: приложение поддерживается только на macOS{RESET}", file=sys.stderr)
             return 1
 
-        args = parse_arguments()
         folder_path = os.path.abspath(args.path)
         _ensure_folder(folder_path)
 
-        print(f"{BOLD}Сканирование директории: {folder_path}{RESET}")
+        print(f"{BOLD}link_checker {__version__} — сканирование директории: {folder_path}{RESET}")
 
         links_map = extract_links_from_files(folder_path)
         if not links_map:

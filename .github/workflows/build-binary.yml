@@ -1,0 +1,48 @@
+name: Build macOS binary
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - main.py
+      - .github/workflows/build-binary.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build
+        run: pyinstaller --onefile --name link_checker main.py
+
+      - name: Smoke test
+        run: ./dist/link_checker test --timeout 2
+
+      - name: Commit binary back to branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dist/link_checker
+          if git diff --cached --quiet; then
+            echo "Binary unchanged, nothing to commit"
+          else
+            git commit -m "Rebuild macOS binary (CI)"
+            git push
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: link_checker-macos
+          path: dist/link_checker
