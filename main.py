@@ -128,15 +128,15 @@ def _resolve_local_url(target: str, source_file: str) -> str:
     return f'file://{os.path.normpath(raw_path)}'
 
 
-def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]]]:
+def extract_links_from_files(folder_path: str) -> Dict[str, List[str]]:
     """
     Извлечение ссылок из .md файлов с помощью find + grep.
 
     Returns:
-        Dict[check_url, List[(file_path, display_url)]]
+        Dict[url, List[file_path]]
 
-    check_url — ссылка для проверки (file:// всегда абсолютная),
-    display_url — ссылка как она записана в .md файле.
+    url — ссылка для проверки и вывода: http(s) как записана,
+    локальные приводятся к абсолютному виду file:///path.
     """
     folder_path = _ensure_folder(folder_path)
     md_files = find_md_files(folder_path)
@@ -159,7 +159,7 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
     except PermissionError as e:
         raise PermissionError(f"Нет прав доступа к файлам: {e}") from e
 
-    links_map: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+    links_map: Dict[str, List[str]] = defaultdict(list)
     seen = set()
 
     def add_links_from_line(line: str, file_path: str) -> None:
@@ -181,7 +181,7 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
             if key in seen:
                 continue
             seen.add(key)
-            links_map[check_url].append((file_path, url))
+            links_map[check_url].append(file_path)
 
     for raw_line in result.stdout.splitlines():
         # path:line:содержимое строки — путь может содержать ':'
@@ -258,7 +258,7 @@ def check_link_status(link: str, base_path: str, timeout: float = 1.0) -> Tuple[
 
 
 def display_results(
-    results: Dict[str, List[Tuple[str, int, str, str, str]]],
+    results: Dict[str, List[Tuple[str, int, str, str]]],
     total_unique: int,
     folder_path: str,
 ) -> None:
@@ -270,9 +270,9 @@ def display_results(
         if not entries:
             continue
         unique_status[url] = entries[0][0]
-        for status, status_code, message, file_path, display_url in entries:
+        for status, status_code, message, file_path in entries:
             rel_file = os.path.relpath(file_path, folder_path)
-            all_results.append((display_url, status, status_code, message, rel_file))
+            all_results.append((url, status, status_code, message, rel_file))
 
     all_results.sort(key=lambda x: (x[1].startswith('Ok'), x[0]))
 
@@ -349,8 +349,8 @@ def main():
                 link, ('Error(Unknown)', 0, 'Неизвестная ошибка')
             )
             results[link] = [
-                (status, status_code, message, file_path, display_url)
-                for file_path, display_url in files
+                (status, status_code, message, file_path)
+                for file_path in files
             ]
 
         display_results(results, total_unique, folder_path)
