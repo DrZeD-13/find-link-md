@@ -17,6 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Tuple
 from urllib.parse import unquote, urlparse
 
+__version__ = '1.1'
+
 GREEN = '\033[92m'
 RED = '\033[91m'
 RESET = '\033[0m'
@@ -62,6 +64,11 @@ def parse_arguments():
         default=10,
         help='Максимальное количество параллельных HTTP запросов (по умолчанию: 10)'
     )
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'link_checker {__version__}'
+    )
     return parser.parse_args()
 
 
@@ -91,6 +98,14 @@ def find_md_files(folder_path: str) -> List[str]:
         raise RuntimeError(f"Ошибка при поиске файлов: {err}")
 
     return [line for line in result.stdout.splitlines() if line]
+
+
+def _has_utf16_bom(file_path: str) -> bool:
+    try:
+        with open(file_path, 'rb') as fh:
+            return fh.read(2) in (b'\xff\xfe', b'\xfe\xff')
+    except OSError:
+        return False
 
 
 def _resolve_local_url(target: str, source_file: str) -> str:
@@ -129,13 +144,16 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
         raise ValueError("В указанной директории нет .md файлов")
 
     try:
+        # -a: файлы с бинарными байтами не пропускать молча
         result = subprocess.run(
             [
                 'find', folder_path, '-name', '*.md', '-type', 'f',
-                '-exec', 'grep', '-Hn', '-F', GREP_LINE_MARKER, '{}', ';',
+                '-exec', 'grep', '-Hn', '-a', '-F', GREP_LINE_MARKER, '{}', ';',
             ],
             capture_output=True,
             text=True,
+            encoding='utf-8',
+            errors='replace',
             check=False,
         )
     except PermissionError as e:
@@ -144,13 +162,7 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
     links_map: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
     seen = set()
 
-    for raw_line in result.stdout.splitlines():
-        # path:line:содержимое строки — путь может содержать ':'
-        parts = raw_line.split(':', 2)
-        if len(parts) < 3:
-            continue
-        file_path, _line_no, line = parts
-
+    def add_links_from_line(line: str, file_path: str) -> None:
         for url_match in _LINK_RE.finditer(line):
             url = url_match.group(1).strip()
 
@@ -170,6 +182,26 @@ def extract_links_from_files(folder_path: str) -> Dict[str, List[Tuple[str, str]
                 continue
             seen.add(key)
             links_map[check_url].append((file_path, url))
+
+    for raw_line in result.stdout.splitlines():
+        # path:line:содержимое строки — путь может содержать ':'
+        parts = raw_line.split(':', 2)
+        if len(parts) < 3:
+            continue
+        file_path, _line_no, line = parts
+        add_links_from_line(line, file_path)
+
+    # UTF-16 файлы (с BOM) grep не видит: подстрока "](" в них разбита
+    # нулевыми байтами, поэтому такие файлы разбираем напрямую в Python
+    for file_path in md_files:
+        if not _has_utf16_bom(file_path):
+            continue
+        try:
+            with open(file_path, encoding='utf-16', errors='replace') as fh:
+                for line in fh:
+                    add_links_from_line(line, file_path)
+        except OSError:
+            continue
 
     return dict(links_map)
 
@@ -277,15 +309,16 @@ def display_results(
 def main():
     """Главная функция программы"""
     try:
+        args = parse_arguments()
+
         if sys.platform != 'darwin':
             print(f"{RED}Ошибка: приложение поддерживается только на macOS{RESET}", file=sys.stderr)
             return 1
 
-        args = parse_arguments()
         folder_path = os.path.abspath(args.path)
         _ensure_folder(folder_path)
 
-        print(f"{BOLD}Сканирование директории: {folder_path}{RESET}")
+        print(f"{BOLD}link_checker {__version__} — сканирование директории: {folder_path}{RESET}")
 
         links_map = extract_links_from_files(folder_path)
         if not links_map:

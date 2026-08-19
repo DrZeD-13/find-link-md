@@ -32,6 +32,13 @@ python3 main.py /path/to/folder
 python3 main.py /path/to/folder --timeout 1.0 --max-workers 10
 ```
 
+Проверить версию установленной сборки:
+```bash
+./link_checker --version
+```
+
+Файлы `.md` поддерживаются в кодировках UTF-8 и UTF-16 (с BOM).
+
 ## Пример вывода
 Таблица со статусом, ссылкой и путём к `.md` файлу. Сначала ошибки, затем успешные проверки.
 
