@@ -49,7 +49,12 @@ python3 main.py /path/to/folder --timeout 1.0 --max-workers 10
 Статистика считается по уникальным ссылкам. Если одна ссылка встречается в нескольких файлах, HTTP/file статус запрашивается один раз.
 
 ## Сборка
+PyInstaller лучше ставить в виртуальное окружение (на macOS с Homebrew `pip install` в системный Python не сработает).
+
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install pyinstaller
 pyinstaller --onefile --name link_checker main.py
 ```
 
